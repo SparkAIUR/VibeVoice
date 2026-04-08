@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vibevoice
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vibevoice-vllm
+  namespace: vibevoice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vibevoice-vllm
+  template:
+    metadata:
+      labels:
+        app: vibevoice-vllm
+    spec:
+      # Matches Docker --ipc=host; remove if your cluster policy disallows host IPC.
+      hostIPC: true
+
+      # Pin to the GPU node that has the mounted host paths.
+      nodeSelector:
+        kubernetes.io/hostname: hpldgx02
+
+      containers:
+      - name: vibevoice-vllm
+        image: vllm/vllm-openai:v0.14.1
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          python3 /app/vllm_plugin/scripts/start_server.py \
+            --max-model-len 65536 \
+            --max-num-seqs 8 \
+            --gpu-memory-utilization 0.90 \
+            --enforce-eager
+
+        env:
+        - name: VIBEVOICE_FFMPEG_MAX_CONCURRENCY
+          value: "20"
+        - name: VLLM_MEDIA_LOADING_THREAD_COUNT
+          value: "8"
+        - name: VIBEVOICE_MAX_AUDIO_DURATION
+          value: "7200"
+        - name: PYTORCH_ALLOC_CONF
+          value: "expandable_segments:True"
+
+        ports:
+        - name: http
+          containerPort: 8000
+
+        resources:
+          requests:
+            cpu: "8"
+            memory: 64Gi
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "24"
+            memory: 120Gi
+            nvidia.com/gpu: "1"
+
+        startupProbe:
+          httpGet:
+            path: /v1/models
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 180
+        readinessProbe:
+          httpGet:
+            path: /v1/models
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 12
+        livenessProbe:
+          httpGet:
+            path: /v1/models
+            port: http
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 3
+          failureThreshold: 6
+
+        volumeMounts:
+        - name: vibevoice-src
+          mountPath: /app
+        - name: audio-calls
+          mountPath: /data/audio-calls
+          readOnly: true
+        - name: huggingface-cache
+          mountPath: /root/.cache/huggingface
+        - name: shm
+          mountPath: /dev/shm
+
+      volumes:
+      - name: vibevoice-src
+        hostPath:
+          path: /shared/projects/VibeVoice
+          type: Directory
+      - name: audio-calls
+        hostPath:
+          path: /data/audio-calls
+          type: Directory
+      - name: huggingface-cache
+        hostPath:
+          path: /shared/projects/.cache/huggingface
+          type: DirectoryOrCreate
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vibevoice-vllm
+  namespace: vibevoice
+spec:
+  selector:
+    app: vibevoice-vllm
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http
+  type: ClusterIP

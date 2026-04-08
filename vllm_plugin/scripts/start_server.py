@@ -89,9 +89,10 @@ def _build_vllm_cmd(model_path: str, port: int,
                      data_parallel_size: int = 1,
                      max_num_seqs: int = 64,
                      max_model_len: int = 65536,
-                     gpu_memory_utilization: float = 0.8) -> list[str]:
+                     gpu_memory_utilization: float = 0.8,
+                     enforce_eager: bool = False) -> list[str]:
     """Build the vllm serve command."""
-    return [
+    cmd = [
         "vllm", "serve", model_path,
         "--served-model-name", "vibevoice",
         "--trust-remote-code",
@@ -107,6 +108,10 @@ def _build_vllm_cmd(model_path: str, port: int,
         "--allowed-local-media-path", "/app",
         "--port", str(port),
     ]
+    if enforce_eager:
+        # Helpful on newer GPU architectures where Triton/PTXAS codegen may fail.
+        cmd.append("--enforce-eager")
+    return cmd
 
 
 def start_vllm_server(model_path: str, port: int,
@@ -114,7 +119,8 @@ def start_vllm_server(model_path: str, port: int,
                       data_parallel_size: int = 1,
                       max_num_seqs: int = 64,
                       max_model_len: int = 65536,
-                      gpu_memory_utilization: float = 0.8) -> None:
+                      gpu_memory_utilization: float = 0.8,
+                      enforce_eager: bool = False) -> None:
     """Start a single vLLM server (replaces current process)."""
     print(f"\n{'='*60}")
     print(f"  Starting vLLM server on port {port}")
@@ -123,6 +129,7 @@ def start_vllm_server(model_path: str, port: int,
     print(f"  Max Num Seqs:         {max_num_seqs}")
     print(f"  Max Model Len:        {max_model_len}")
     print(f"  GPU Mem Utilization:  {gpu_memory_utilization}")
+    print(f"  Enforce Eager:        {enforce_eager}")
     print(f"{'='*60}\n")
     
     vllm_cmd = _build_vllm_cmd(
@@ -132,6 +139,7 @@ def start_vllm_server(model_path: str, port: int,
         max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
         gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=enforce_eager,
     )
     os.execvp("vllm", vllm_cmd)
 
@@ -204,7 +212,8 @@ def start_dp_server(model_path: str, frontend_port: int,
                     tensor_parallel_size: int = 1,
                     max_num_seqs: int = 64,
                     max_model_len: int = 65536,
-                    gpu_memory_utilization: float = 0.8) -> None:
+                    gpu_memory_utilization: float = 0.8,
+                    enforce_eager: bool = False) -> None:
     """Start multiple vLLM workers behind nginx for data parallelism.
     
     Launches N independent vLLM processes (one per GPU group) on internal
@@ -243,6 +252,7 @@ def start_dp_server(model_path: str, frontend_port: int,
     print(f"  GPUs per replica:  {gpus_per_replica}")
     print(f"  Max Num Seqs:      {max_num_seqs}")
     print(f"  Max Model Len:     {max_model_len}")
+    print(f"  Enforce Eager:     {enforce_eager}")
     print(f"  FFmpeg concurrency (per worker): {ffmpeg_concurrency}")
     print(f"  Media loading threads (per worker): {media_threads}")
     print(f"{'='*60}\n")
@@ -269,6 +279,7 @@ def start_dp_server(model_path: str, frontend_port: int,
             max_num_seqs=max_num_seqs,
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=enforce_eager,
         )
 
         print(f"  Launching worker rank={rank} on GPU(s) {gpu_ids}, port {port}")
@@ -406,6 +417,15 @@ Examples:
         dest="gpu_memory_utilization",
         help="GPU memory utilization fraction (default: 0.8)"
     )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        dest="enforce_eager",
+        help=(
+            "Disable CUDA graph / torch compile execution path for compatibility "
+            "with newer GPUs where Triton/PTXAS codegen may fail"
+        ),
+    )
     args = parser.parse_args()
 
     print("\n" + "="*60)
@@ -435,6 +455,7 @@ Examples:
             max_num_seqs=args.max_num_seqs,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=args.enforce_eager,
         )
     else:
         start_vllm_server(
@@ -444,6 +465,7 @@ Examples:
             max_num_seqs=args.max_num_seqs,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=args.enforce_eager,
         )
 
 

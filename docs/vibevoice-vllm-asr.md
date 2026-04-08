@@ -123,6 +123,22 @@ docker logs -f vibevoice-vllm
 > - Use `docker stop vibevoice-vllm` to stop the service
 > - The model will be downloaded to HuggingFace cache (`~/.cache/huggingface`) inside the container
 
+## ☸️ Kubernetes Deployment
+
+For Kubernetes deployment with mounted host paths (equivalent to Docker `-v` mounts), use:
+
+- Guide: `docs/vibevoice-vllm-kubernetes.md`
+- Manifests: `deploy/kubernetes/vibevoice-vllm-hostpath.yaml`
+
+Quick start:
+
+```bash
+kubectl apply -k deploy/kubernetes
+kubectl -n vibevoice rollout status deploy/vibevoice-vllm
+kubectl -n vibevoice port-forward svc/vibevoice-vllm 8000:8000
+curl -sf http://127.0.0.1:8000/v1/models
+```
+
 ## 🚀 Usages
 
 ### Test the API
@@ -186,4 +202,7 @@ docker exec -it vibevoice-vllm python3 vllm_plugin/tests/test_api_auto_recover.p
    - Verify installation: `pip show vibevoice`
    - Check entry point: `pip show -f vibevoice | grep entry`
 
-
+5. **Triton/PTXAS startup failure on newer GPUs (e.g., `sm_121a`)**
+   - Add `--enforce-eager` to launcher command:
+     - `python3 /app/vllm_plugin/scripts/start_server.py --enforce-eager`
+   - This disables the compile/CUDA-graph execution path and avoids Triton PTXAS codegen failures.
