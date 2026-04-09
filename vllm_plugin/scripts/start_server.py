@@ -159,10 +159,10 @@ def _write_nginx_config(frontend_port: int, backend_ports: list[int],
     """Write nginx config for round-robin load balancing.
     
     Args:
-        num_workers: Number of nginx worker processes. 0 = auto (2 × num backends).
+        num_workers: Number of nginx worker processes. 0 = auto (4 × num backends).
     """
     if num_workers <= 0:
-        num_workers = len(backend_ports) * 2
+        num_workers = len(backend_ports) * 4
     client_max_body_size = os.environ.get("VIBEVOICE_NGINX_CLIENT_MAX_BODY_SIZE", "5g")
     client_body_buffer_size = os.environ.get("VIBEVOICE_NGINX_CLIENT_BODY_BUFFER_SIZE", "10m")
     proxy_request_buffering = os.environ.get("VIBEVOICE_NGINX_PROXY_REQUEST_BUFFERING", "off")
