@@ -46,10 +46,10 @@ def install_system_deps() -> None:
     )
 
 
-def install_vibevoice() -> None:
+def install_vibevoice(repo_path: str = "/app") -> None:
     """Install VibeVoice Python package."""
     run_command(
-        [sys.executable, "-m", "pip", "install", "-e", "/app[vllm]"],
+        [sys.executable, "-m", "pip", "install", "-e", f"{repo_path}[vllm]"],
         "Installing VibeVoice with vLLM support"
     )
 
@@ -426,6 +426,13 @@ Examples:
             "with newer GPUs where Triton/PTXAS codegen may fail"
         ),
     )
+    parser.add_argument(
+        "--repo-path",
+        type=str,
+        default="/app",
+        dest="repo_path",
+        help="Path to the repository (default: /app)"
+    )
     args = parser.parse_args()
 
     print("\n" + "="*60)
@@ -437,7 +444,7 @@ Examples:
         install_system_deps()
 
     # Step 2: Install VibeVoice
-    install_vibevoice()
+    install_vibevoice(args.repo_path)
 
     # Step 3: Download model
     model_path = download_model(args.model)
