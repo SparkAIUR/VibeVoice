@@ -23,6 +23,19 @@ import base64
 from vibevoice.processor.audio_utils import load_audio_use_ffmpeg, load_audio_bytes_use_ffmpeg, AudioNormalizer
 
 
+def _get_max_audio_duration_sec(default_sec: int = 3660) -> int:
+    """Resolve max audio duration for scheduler/profiling bounds.
+
+    Keep this aligned with runtime validation in vllm_plugin/inputs.py.
+    """
+    raw = os.environ.get("VIBEVOICE_MAX_AUDIO_DURATION", str(default_sec)).strip()
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        value = int(default_sec)
+    return value if value > 0 else int(default_sec)
+
+
 def _ffmpeg_load_bytes(data: bytes) -> tuple[np.ndarray, int]:
     """Load audio bytes using FFmpeg via stdin-pipe decoding.
     
@@ -593,8 +606,8 @@ class VibeVoiceProcessingInfo(BaseProcessingInfo):
         compress_ratio = int(_cfg("speech_tok_compress_ratio", 3200))
         sample_rate = int(_cfg("target_sample_rate", 24000))
 
-        # Upper bound: 61-minute audio at 24 kHz
-        max_audio_samples = 61 * 60 * sample_rate  # 88,464,000
+        # Upper bound driven by VIBEVOICE_MAX_AUDIO_DURATION (default 61 minutes)
+        max_audio_samples = _get_max_audio_duration_sec() * sample_rate
         max_audio_tokens = int(np.ceil(max_audio_samples / compress_ratio)) + 3
 
         # Cannot exceed the model's context window
@@ -618,7 +631,7 @@ class VibeVoiceDummyInputsBuilder(BaseDummyInputsBuilder[VibeVoiceProcessingInfo
     def _get_max_audio_samples(self, seq_len: int) -> int:
         """Compute maximum audio samples consistent with ``get_mm_max_tokens_per_item``.
         
-        Uses the same formula: max_tokens = min(ceil(61min * sr / ratio) + 3, seq_len),
+        Uses the same formula: max_tokens = min(ceil(max_duration * sr / ratio) + 3, seq_len),
         then converts back to samples.
         """
         hf_config = self.info.get_hf_config()
@@ -631,8 +644,8 @@ class VibeVoiceDummyInputsBuilder(BaseDummyInputsBuilder[VibeVoiceProcessingInfo
         compress_ratio = int(_cfg("speech_tok_compress_ratio", 3200))
         sample_rate = int(_cfg("target_sample_rate", 24000))
 
-        # Upper bound: 61-minute audio at 24 kHz
-        max_hour_samples = 61 * 60 * sample_rate  # 88,464,000
+        # Upper bound driven by VIBEVOICE_MAX_AUDIO_DURATION (default 61 minutes)
+        max_hour_samples = _get_max_audio_duration_sec() * sample_rate
         max_tokens_from_audio = int(np.ceil(max_hour_samples / compress_ratio)) + 3
         # Cannot exceed model context window
         max_tokens = min(max_tokens_from_audio, seq_len)
