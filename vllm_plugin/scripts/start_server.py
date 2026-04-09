@@ -163,6 +163,20 @@ def _write_nginx_config(frontend_port: int, backend_ports: list[int],
     """
     if num_workers <= 0:
         num_workers = len(backend_ports) * 2
+    client_max_body_size = os.environ.get("VIBEVOICE_NGINX_CLIENT_MAX_BODY_SIZE", "5g")
+    client_body_buffer_size = os.environ.get("VIBEVOICE_NGINX_CLIENT_BODY_BUFFER_SIZE", "10m")
+    proxy_request_buffering = os.environ.get("VIBEVOICE_NGINX_PROXY_REQUEST_BUFFERING", "off")
+    proxy_buffering = os.environ.get("VIBEVOICE_NGINX_PROXY_BUFFERING", "off")
+    proxy_buffer_size = os.environ.get("VIBEVOICE_NGINX_PROXY_BUFFER_SIZE", "64k")
+    proxy_buffers = os.environ.get("VIBEVOICE_NGINX_PROXY_BUFFERS", "16 64k")
+    proxy_max_temp_file_size = os.environ.get("VIBEVOICE_NGINX_PROXY_MAX_TEMP_FILE_SIZE", "0")
+    proxy_read_timeout = os.environ.get("VIBEVOICE_NGINX_PROXY_READ_TIMEOUT", "21600s")
+    proxy_send_timeout = os.environ.get("VIBEVOICE_NGINX_PROXY_SEND_TIMEOUT", "21600s")
+    proxy_connect_timeout = os.environ.get("VIBEVOICE_NGINX_PROXY_CONNECT_TIMEOUT", "120s")
+    proxy_next_upstream = os.environ.get("VIBEVOICE_NGINX_PROXY_NEXT_UPSTREAM", "off")
+    proxy_next_upstream_tries = os.environ.get("VIBEVOICE_NGINX_PROXY_NEXT_UPSTREAM_TRIES", "1")
+    proxy_next_upstream_timeout = os.environ.get("VIBEVOICE_NGINX_PROXY_NEXT_UPSTREAM_TIMEOUT", "0")
+
     backends = "\n".join(f"        server 127.0.0.1:{p};" for p in backend_ports)
     config = textwrap.dedent(f"""\
         worker_processes {num_workers};
@@ -184,17 +198,22 @@ def _write_nginx_config(frontend_port: int, backend_ports: list[int],
 
             server {{
                 listen {frontend_port};
-                client_max_body_size 200m;
-                client_body_buffer_size 10m;
-                proxy_buffering on;
-                proxy_buffer_size 64k;
-                proxy_buffers 16 64k;
+                client_max_body_size {client_max_body_size};
+                client_body_buffer_size {client_body_buffer_size};
+                proxy_request_buffering {proxy_request_buffering};
+                proxy_buffering {proxy_buffering};
+                proxy_buffer_size {proxy_buffer_size};
+                proxy_buffers {proxy_buffers};
+                proxy_max_temp_file_size {proxy_max_temp_file_size};
 
                 location / {{
                     proxy_pass http://vllm_backends;
-                    proxy_read_timeout 600s;
-                    proxy_connect_timeout 10s;
-                    proxy_send_timeout 600s;
+                    proxy_read_timeout {proxy_read_timeout};
+                    proxy_connect_timeout {proxy_connect_timeout};
+                    proxy_send_timeout {proxy_send_timeout};
+                    proxy_next_upstream {proxy_next_upstream};
+                    proxy_next_upstream_tries {proxy_next_upstream_tries};
+                    proxy_next_upstream_timeout {proxy_next_upstream_timeout};
                     proxy_http_version 1.1;
                     proxy_set_header Connection "";
                 }}
