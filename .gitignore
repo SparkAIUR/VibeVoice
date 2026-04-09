@@ -177,3 +177,5 @@ exp
 .gradio/
 experimental_voices
 artifacts/chunking_experiment/endpoint_prod_02172026_pilot4*
+artifacts/*
+/vllm_plugin/experiments/manifests
