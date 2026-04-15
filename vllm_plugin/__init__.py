@@ -8,13 +8,30 @@ The plugin is automatically loaded by vLLM via the 'vllm.general_plugins'
 entry point defined in pyproject.toml.
 """
 
-from vllm.model_executor.models import ModelRegistry
-from transformers import AutoConfig, AutoTokenizer, Qwen2Tokenizer, AutoProcessor, Qwen2AudioProcessor
+from typing import Optional
 
-from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
-from vibevoice.modular.modular_vibevoice_text_tokenizer import VibeVoiceASRTextTokenizerFast
 
-from .model import VibeVoiceForCausalLM
+_IMPORT_ERROR: Optional[ModuleNotFoundError] = None
+
+try:
+    from vllm.model_executor.models import ModelRegistry
+    from transformers import AutoConfig, AutoTokenizer, Qwen2Tokenizer, AutoProcessor, Qwen2AudioProcessor
+
+    from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
+    from vibevoice.modular.modular_vibevoice_text_tokenizer import VibeVoiceASRTextTokenizerFast
+
+    from .model import VibeVoiceForCausalLM
+except ModuleNotFoundError as exc:
+    _IMPORT_ERROR = exc
+    ModelRegistry = None
+    AutoConfig = None
+    AutoTokenizer = None
+    Qwen2Tokenizer = None
+    AutoProcessor = None
+    Qwen2AudioProcessor = None
+    VibeVoiceConfig = None
+    VibeVoiceASRTextTokenizerFast = None
+    VibeVoiceForCausalLM = None
 
 
 def register_vibevoice():
@@ -27,6 +44,12 @@ def register_vibevoice():
     - Qwen2AudioProcessor with AutoProcessor
     - VibeVoiceForCausalLM with vLLM ModelRegistry
     """
+    if _IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "VibeVoice plugin dependencies are unavailable. "
+            "Install vllm and model dependencies before calling register_vibevoice()."
+        ) from _IMPORT_ERROR
+
     # Register the configuration class with transformers
     AutoConfig.register("vibevoice", VibeVoiceConfig)
 

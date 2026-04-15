@@ -26,6 +26,11 @@ from typing import Any, Iterable
 
 import requests
 
+try:
+    from vllm_plugin.experiments.expert_review import make_review_item, write_review_bundle
+except ModuleNotFoundError:
+    from expert_review import make_review_item, write_review_bundle
+
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant that transcribes audio input into text output "
@@ -723,6 +728,71 @@ def _build_manual_review(
     _write_text(manual_review_path, "\n".join(lines) + "\n")
 
 
+def _build_expert_review_bundle(
+    output_dir: Path,
+    runs: list[dict[str, Any]],
+    transcript_root: Path,
+) -> None:
+    items: list[dict[str, Any]] = []
+    for run in runs:
+        if run.get("scenario") == "gold_full":
+            continue
+        if run.get("file_id") == "__aggregate__":
+            continue
+        if not run.get("success"):
+            continue
+        file_slug = _slugify(str(run["file_id"]))
+        scenario_slug = _slugify(str(run["scenario"]))
+        gold_json_path = transcript_root / file_slug / "gold_full.json"
+        cand_json_path = transcript_root / file_slug / f"{scenario_slug}.json"
+        gold_txt_path = transcript_root / file_slug / "gold_full.txt"
+        cand_txt_path = transcript_root / file_slug / f"{scenario_slug}.txt"
+        if not gold_json_path.exists() or not cand_json_path.exists():
+            continue
+
+        gold_payload = json.loads(gold_json_path.read_text(encoding="utf-8"))
+        cand_payload = json.loads(cand_json_path.read_text(encoding="utf-8"))
+        diff_snippets = _extract_diff_snippets(
+            _join_segment_content(gold_payload.get("segments", [])),
+            _join_segment_content(cand_payload.get("segments", [])),
+        )
+        items.append(
+            make_review_item(
+                comparison={
+                    "file_id": run.get("file_id"),
+                    "scenario": run.get("scenario"),
+                },
+                gold_txt_path=gold_txt_path,
+                candidate_txt_path=cand_txt_path,
+                metrics={
+                    key: run.get(key)
+                    for key in (
+                        "word_drift",
+                        "seam_word_drift",
+                        "char_drift",
+                        "boundary_mae_sec",
+                        "chunk_latency_p95_sec",
+                        "wall_time_sec",
+                        "rtf",
+                    )
+                },
+                diff_snippets=diff_snippets,
+            )
+        )
+
+    write_review_bundle(
+        output_dir=output_dir,
+        title="Chunking Experiment Expert Review Template",
+        items=items,
+        group_by_fields=("scenario",),
+        source_kind="chunking_experiment",
+        metadata={
+            "transcript_root": str(transcript_root),
+            "review_scope": "All successful non-gold transcripts in this run.",
+        },
+    )
+
+
 def _iter_quality_scenarios(
     chunk_minutes: Iterable[int],
     overlap_seconds: float,
@@ -1196,6 +1266,11 @@ def main() -> None:
         manual_review_path=manual_review_path,
         runs=all_runs,
         threshold=args.quality_threshold,
+        transcript_root=output_dir / "transcripts",
+    )
+    _build_expert_review_bundle(
+        output_dir=output_dir,
+        runs=all_runs,
         transcript_root=output_dir / "transcripts",
     )
 

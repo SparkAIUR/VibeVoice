@@ -31,6 +31,11 @@ from typing import Any, Iterable
 
 import requests
 
+try:
+    from vllm_plugin.experiments.expert_review import make_review_item, write_review_bundle
+except ModuleNotFoundError:
+    from expert_review import make_review_item, write_review_bundle
+
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant that transcribes audio input into text output "
@@ -43,6 +48,9 @@ RAW_VARIANT_FEATURES = {
     "shifted_consensus",
     "silence_aligned_boundaries",
     "dynamic_lexicon",
+    "coverage_first_repair",
+    "tail_rescue_backward_pass",
+    "language_aware_translator_mode",
 }
 
 VARIANT_ALIASES: dict[str, set[str]] = {
@@ -52,6 +60,9 @@ VARIANT_ALIASES: dict[str, set[str]] = {
     "idea3_shifted_consensus": {"shifted_consensus"},
     "idea4_silence_aligned_boundaries": {"silence_aligned_boundaries"},
     "idea5_dynamic_lexicon": {"dynamic_lexicon"},
+    "idea6_coverage_first_repair": {"dynamic_lexicon", "coverage_first_repair"},
+    "idea7_tail_rescue_backward_pass": {"dynamic_lexicon", "tail_rescue_backward_pass"},
+    "idea8_language_aware_translator_mode": {"dynamic_lexicon", "language_aware_translator_mode"},
 }
 
 STOPWORDS_EN = {
@@ -307,17 +318,99 @@ def _extract_dynamic_terms(
     return terms
 
 
+def _infer_language_hint_from_text(
+    text: str,
+    fallback_language: str | None,
+) -> str | None:
+    tokens = _tokenize_terms(text)
+    if not tokens:
+        return fallback_language
+    stop_es = STOPWORDS_ES
+    stop_en = STOPWORDS_EN
+    es_hits = sum(1 for token in tokens if token in stop_es)
+    en_hits = sum(1 for token in tokens if token in stop_en)
+    if es_hits >= 6 and en_hits >= 6:
+        return "mixed (english + spanish)"
+    if es_hits >= en_hits + 4:
+        return "spanish"
+    if en_hits >= es_hits + 4:
+        return "english"
+    return fallback_language or "mixed (english + spanish)"
+
+
+def _segment_end_seconds(segments: list[dict[str, Any]]) -> float:
+    if not segments:
+        return 0.0
+    return max(float(seg["End"]) for seg in segments)
+
+
+def _replace_window_segments(
+    segments: list[dict[str, Any]],
+    replacement: list[dict[str, Any]],
+    *,
+    win_start: float,
+    win_end: float,
+    overlap_seconds: float,
+) -> list[dict[str, Any]]:
+    updated = [
+        seg
+        for seg in segments
+        if float(seg["End"]) <= win_start or float(seg["Start"]) >= win_end
+    ]
+    updated.extend(replacement)
+    updated.sort(key=lambda seg: (float(seg["Start"]), float(seg["End"])))
+    deduped, _ = _dedupe_overlap_segments(updated, overlap_seconds=overlap_seconds)
+    return deduped
+
+
+def _request_window_transcript(
+    item: ManifestItem,
+    *,
+    start_sec: float,
+    end_sec: float,
+    args: argparse.Namespace,
+    context_tail: str | None,
+    hotwords: str | None,
+    translator_mode: bool,
+) -> ApiCallResult:
+    duration = max(0.0, end_sec - start_sec)
+    chunk_bytes = _extract_chunk_wav_bytes(item.path, start_sec, duration)
+    prompt = _build_prompt(
+        duration_sec=duration,
+        language=item.language,
+        hotwords=hotwords,
+        context_tail=context_tail,
+        translator_mode=translator_mode,
+    )
+    return _post_transcription_request(
+        api_url=args.api_url,
+        model=args.model,
+        mime="audio/wav",
+        audio_bytes=chunk_bytes,
+        prompt_text=prompt,
+        max_tokens=_resolve_chunk_max_tokens(args),
+        timeout_seconds=args.timeout_seconds,
+        max_retries=args.max_retries,
+    )
+
+
 def _build_prompt(
     duration_sec: float,
     language: str | None,
     hotwords: str | None,
     context_tail: str | None,
+    translator_mode: bool = False,
 ) -> str:
     show_keys = "Start, End, Speaker, Content"
     max_segments = max(12, min(240, int(math.ceil(max(duration_sec, 1.0) / 25.0))))
     parts = [f"This is a {duration_sec:.2f} seconds audio chunk."]
     if language:
         parts.append(f"Language hint: {language}.")
+    if translator_mode:
+        parts.append(
+            "This call may include interpreter turns and code-switching between English and Spanish. "
+            "Keep each utterance in the original spoken language and do not translate."
+        )
     if hotwords:
         parts.append(f"Extra info (hotwords): {hotwords.strip()}")
     if context_tail:
@@ -1028,6 +1121,8 @@ def _run_chunks_once(
     parse_warnings: list[str] = []
     context_tail: str | None = None
     lex_counter: collections.Counter[str] = collections.Counter()
+    language_hints_used: list[str] = []
+    translator_mode_enabled = "language_aware_translator_mode" in variant_features
 
     for idx, (start_sec, end_sec) in enumerate(chunks):
         chunk_duration = end_sec - start_sec
@@ -1037,12 +1132,19 @@ def _run_chunks_once(
         if "dynamic_lexicon" in variant_features and lex_counter:
             dynamic_terms = [token for token, _ in lex_counter.most_common(args.dynamic_lexicon_terms)]
         hotwords = _merge_hotwords(item.hotwords, dynamic_terms)
+        language_hint = item.language
+        if translator_mode_enabled:
+            context_source = context_tail or _join_segment_content(merged_segments[-6:])
+            language_hint = _infer_language_hint_from_text(context_source, item.language)
+            if language_hint:
+                language_hints_used.append(language_hint)
 
         prompt = _build_prompt(
             duration_sec=chunk_duration,
-            language=item.language,
+            language=language_hint,
             hotwords=hotwords,
             context_tail=context_tail if scenario.context_carry else None,
+            translator_mode=translator_mode_enabled,
         )
 
         call = _post_transcription_request(
@@ -1074,7 +1176,7 @@ def _run_chunks_once(
         if "dynamic_lexicon" in variant_features:
             for token in _extract_dynamic_terms(
                 _join_segment_content(call.segments),
-                item.language,
+                None if translator_mode_enabled else item.language,
                 min_len=args.dynamic_lexicon_min_len,
             ):
                 lex_counter[token] += 1
@@ -1122,6 +1224,7 @@ def _run_chunks_once(
         "retry_count": retries,
         "overlap_dropped_segments": dropped,
         "parse_warnings": parse_warnings,
+        "language_hints_used": language_hints_used,
     }
     return deduped_segments, details
 
@@ -1133,12 +1236,14 @@ def _run_seam_micro_redo(
     segments: list[dict[str, Any]],
     seam_boundaries: list[float],
     total_duration: float,
+    variant_features: set[str],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     updated = list(segments)
     redo_latencies: list[float] = []
     redo_retries = 0
     redo_warnings: list[str] = []
     successful_redos = 0
+    translator_mode = "language_aware_translator_mode" in variant_features
 
     for seam in seam_boundaries:
         win_start = max(0.0, seam - args.micro_redo_window_seconds)
@@ -1153,11 +1258,15 @@ def _run_seam_micro_redo(
             left_text = _join_segment_content(left_context_segments)
             context_tail = left_text[-args.context_tail_chars :] if left_text else None
 
+        language_hint = item.language
+        if translator_mode:
+            language_hint = _infer_language_hint_from_text(context_tail or "", item.language)
         prompt = _build_prompt(
             duration_sec=win_end - win_start,
-            language=item.language,
+            language=language_hint,
             hotwords=item.hotwords,
             context_tail=context_tail,
+            translator_mode=translator_mode,
         )
         call = _post_transcription_request(
             api_url=args.api_url,
@@ -1197,6 +1306,185 @@ def _run_seam_micro_redo(
         "redo_latencies_sec": [round(v, 6) for v in redo_latencies],
         "redo_retry_count": redo_retries,
         "redo_warnings": redo_warnings,
+    }
+    return updated, stats
+
+
+def _run_tail_rescue_backward_pass(
+    item: ManifestItem,
+    scenario: ScenarioConfig,
+    args: argparse.Namespace,
+    segments: list[dict[str, Any]],
+    total_duration: float,
+    variant_features: set[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    tail_window_sec = min(
+        float(total_duration),
+        max(float(args.tail_rescue_min_seconds), float(args.tail_rescue_minutes) * 60.0),
+    )
+    tail_start = max(0.0, float(total_duration) - tail_window_sec)
+    left_segments = [seg for seg in segments if float(seg["End"]) <= tail_start]
+    context_tail = None
+    if scenario.context_carry and left_segments:
+        text = _join_segment_content(left_segments)
+        context_tail = text[-args.context_tail_chars :] if text else None
+
+    hotwords = item.hotwords
+    if "dynamic_lexicon" in variant_features:
+        current_text = _join_segment_content(segments)
+        dyn_terms = _extract_dynamic_terms(
+            current_text,
+            None if "language_aware_translator_mode" in variant_features else item.language,
+            min_len=args.dynamic_lexicon_min_len,
+        )
+        hotwords = _merge_hotwords(item.hotwords, dyn_terms[: args.dynamic_lexicon_terms])
+
+    call = _request_window_transcript(
+        item=item,
+        start_sec=tail_start,
+        end_sec=float(total_duration),
+        args=args,
+        context_tail=context_tail,
+        hotwords=hotwords,
+        translator_mode="language_aware_translator_mode" in variant_features,
+    )
+    if not call.success:
+        return segments, {
+            "tail_rescue_attempted": True,
+            "tail_rescue_applied": False,
+            "tail_rescue_window_sec": [round(tail_start, 3), round(float(total_duration), 3)],
+            "tail_rescue_latency_sec": round(call.latency_sec, 6),
+            "tail_rescue_retry_count": int(call.retry_count),
+            "tail_rescue_warning": call.error,
+        }
+
+    replacement = _offset_segments(call.segments, offset_sec=tail_start, chunk_idx=300000)
+    updated = _replace_window_segments(
+        segments,
+        replacement,
+        win_start=tail_start,
+        win_end=float(total_duration),
+        overlap_seconds=scenario.overlap_seconds,
+    )
+    warning = call.parse_warning
+    return updated, {
+        "tail_rescue_attempted": True,
+        "tail_rescue_applied": True,
+        "tail_rescue_window_sec": [round(tail_start, 3), round(float(total_duration), 3)],
+        "tail_rescue_latency_sec": round(call.latency_sec, 6),
+        "tail_rescue_retry_count": int(call.retry_count),
+        "tail_rescue_warning": warning,
+    }
+
+
+def _run_coverage_first_repair(
+    item: ManifestItem,
+    scenario: ScenarioConfig,
+    args: argparse.Namespace,
+    segments: list[dict[str, Any]],
+    seam_boundaries: list[float],
+    total_duration: float,
+    variant_features: set[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    updated = list(segments)
+    coverage_before = _segment_end_seconds(updated)
+    windows: list[tuple[float, float]] = []
+
+    # Tail under-coverage is the most severe failure mode in long calls.
+    tail_gap = float(total_duration) - coverage_before
+    if tail_gap > float(args.coverage_tail_gap_seconds):
+        windows.append(
+            (
+                max(0.0, coverage_before - float(args.coverage_repair_overlap_seconds)),
+                float(total_duration),
+            )
+        )
+
+    seam_guard = float(args.coverage_repair_seam_guard_seconds)
+    window_half = float(args.coverage_repair_window_seconds) / 2.0
+    for seam in seam_boundaries:
+        has_local_coverage = any(
+            float(seg["End"]) >= seam - seam_guard and float(seg["Start"]) <= seam + seam_guard
+            for seg in updated
+        )
+        if has_local_coverage:
+            continue
+        win_start = max(0.0, seam - window_half)
+        win_end = min(float(total_duration), seam + window_half)
+        windows.append((win_start, win_end))
+
+    deduped_windows: list[tuple[float, float]] = []
+    seen: set[tuple[int, int]] = set()
+    for start_sec, end_sec in windows:
+        key = (int(round(start_sec * 10)), int(round(end_sec * 10)))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_windows.append((start_sec, end_sec))
+    deduped_windows = deduped_windows[: max(0, int(args.coverage_repair_max_windows))]
+
+    latencies: list[float] = []
+    retries = 0
+    warnings: list[str] = []
+    applied = 0
+    for win_start, win_end in deduped_windows:
+        if win_end - win_start < 3.0:
+            continue
+        left_segments = [seg for seg in updated if float(seg["End"]) <= win_start]
+        context_tail = None
+        if scenario.context_carry and left_segments:
+            text = _join_segment_content(left_segments)
+            context_tail = text[-args.context_tail_chars :] if text else None
+
+        hotwords = item.hotwords
+        if "dynamic_lexicon" in variant_features:
+            current_text = _join_segment_content(updated)
+            dyn_terms = _extract_dynamic_terms(
+                current_text,
+                None if "language_aware_translator_mode" in variant_features else item.language,
+                min_len=args.dynamic_lexicon_min_len,
+            )
+            hotwords = _merge_hotwords(item.hotwords, dyn_terms[: args.dynamic_lexicon_terms])
+
+        call = _request_window_transcript(
+            item=item,
+            start_sec=win_start,
+            end_sec=win_end,
+            args=args,
+            context_tail=context_tail,
+            hotwords=hotwords,
+            translator_mode="language_aware_translator_mode" in variant_features,
+        )
+        latencies.append(call.latency_sec)
+        retries += call.retry_count
+        if not call.success:
+            warnings.append(f"{win_start:.3f}-{win_end:.3f}: {call.error}")
+            continue
+        if call.parse_warning:
+            warnings.append(f"{win_start:.3f}-{win_end:.3f}: {call.parse_warning}")
+
+        replacement = _offset_segments(call.segments, offset_sec=win_start, chunk_idx=400000 + applied)
+        updated = _replace_window_segments(
+            updated,
+            replacement,
+            win_start=win_start,
+            win_end=win_end,
+            overlap_seconds=scenario.overlap_seconds,
+        )
+        applied += 1
+
+    coverage_after = _segment_end_seconds(updated)
+    stats = {
+        "coverage_repair_attempted": bool(deduped_windows),
+        "coverage_repair_windows_sec": [[round(a, 3), round(b, 3)] for a, b in deduped_windows],
+        "coverage_repair_applied": applied,
+        "coverage_repair_latencies_sec": [round(v, 6) for v in latencies],
+        "coverage_repair_retry_count": retries,
+        "coverage_repair_warnings": warnings,
+        "coverage_before_sec": round(coverage_before, 6),
+        "coverage_after_sec": round(coverage_after, 6),
+        "coverage_tail_gap_before_sec": round(max(0.0, float(total_duration) - coverage_before), 6),
+        "coverage_tail_gap_after_sec": round(max(0.0, float(total_duration) - coverage_after), 6),
     }
     return updated, stats
 
@@ -1282,6 +1570,30 @@ def _run_chunked_transcription(
         "redo_retry_count": 0,
         "redo_warnings": [],
     }
+    coverage_stats = {
+        "coverage_repair_attempted": False,
+        "coverage_repair_windows_sec": [],
+        "coverage_repair_applied": 0,
+        "coverage_repair_latencies_sec": [],
+        "coverage_repair_retry_count": 0,
+        "coverage_repair_warnings": [],
+        "coverage_before_sec": round(_segment_end_seconds(merged_segments), 6),
+        "coverage_after_sec": round(_segment_end_seconds(merged_segments), 6),
+        "coverage_tail_gap_before_sec": round(
+            max(0.0, float(total_duration) - _segment_end_seconds(merged_segments)), 6
+        ),
+        "coverage_tail_gap_after_sec": round(
+            max(0.0, float(total_duration) - _segment_end_seconds(merged_segments)), 6
+        ),
+    }
+    tail_rescue_stats = {
+        "tail_rescue_attempted": False,
+        "tail_rescue_applied": False,
+        "tail_rescue_window_sec": None,
+        "tail_rescue_latency_sec": None,
+        "tail_rescue_retry_count": 0,
+        "tail_rescue_warning": None,
+    }
     if "seam_micro_redo" in variant_features and merged_segments:
         merged_segments, redo_stats = _run_seam_micro_redo(
             item=item,
@@ -1290,10 +1602,40 @@ def _run_chunked_transcription(
             segments=merged_segments,
             seam_boundaries=seam_boundaries,
             total_duration=total_duration,
+            variant_features=variant_features,
         )
         retries += int(redo_stats["redo_retry_count"])
         chunk_latencies.extend(redo_stats["redo_latencies_sec"])
         parse_warnings.extend(redo_stats["redo_warnings"])
+
+    if "coverage_first_repair" in variant_features and merged_segments:
+        merged_segments, coverage_stats = _run_coverage_first_repair(
+            item=item,
+            scenario=scenario,
+            args=args,
+            segments=merged_segments,
+            seam_boundaries=seam_boundaries,
+            total_duration=total_duration,
+            variant_features=variant_features,
+        )
+        retries += int(coverage_stats["coverage_repair_retry_count"])
+        chunk_latencies.extend(coverage_stats["coverage_repair_latencies_sec"])
+        parse_warnings.extend(coverage_stats["coverage_repair_warnings"])
+
+    if "tail_rescue_backward_pass" in variant_features and merged_segments:
+        merged_segments, tail_rescue_stats = _run_tail_rescue_backward_pass(
+            item=item,
+            scenario=scenario,
+            args=args,
+            segments=merged_segments,
+            total_duration=total_duration,
+            variant_features=variant_features,
+        )
+        retries += int(tail_rescue_stats["tail_rescue_retry_count"])
+        if tail_rescue_stats["tail_rescue_latency_sec"] is not None:
+            chunk_latencies.append(float(tail_rescue_stats["tail_rescue_latency_sec"]))
+        if tail_rescue_stats["tail_rescue_warning"]:
+            parse_warnings.append(str(tail_rescue_stats["tail_rescue_warning"]))
 
     merged_segments.sort(key=lambda seg: (float(seg["Start"]), float(seg["End"])))
     merged_segments, dropped_final = _dedupe_overlap_segments(
@@ -1321,6 +1663,13 @@ def _run_chunked_transcription(
         "variant_features": sorted(variant_features),
         "consensus_matches": consensus_matches,
         "redo_request_count": int(redo_stats["redo_request_count"]),
+        "coverage_repair_attempted": bool(coverage_stats["coverage_repair_attempted"]),
+        "coverage_repair_applied": int(coverage_stats["coverage_repair_applied"]),
+        "coverage_tail_gap_before_sec": coverage_stats["coverage_tail_gap_before_sec"],
+        "coverage_tail_gap_after_sec": coverage_stats["coverage_tail_gap_after_sec"],
+        "tail_rescue_attempted": bool(tail_rescue_stats["tail_rescue_attempted"]),
+        "tail_rescue_applied": bool(tail_rescue_stats["tail_rescue_applied"]),
+        "tail_rescue_window_sec": tail_rescue_stats["tail_rescue_window_sec"],
     }
     success = bool(public_segments) and chunk_failures == 0
     error = None if success else "One or more chunk requests failed or no segments produced."
@@ -1446,6 +1795,74 @@ def _build_manual_review(
             lines.append("- No diff snippets could be extracted.")
         lines.append("")
     _write_text(manual_review_path, "\n".join(lines) + "\n")
+
+
+def _build_expert_review_bundle(
+    output_dir: Path,
+    runs: list[dict[str, Any]],
+    transcript_root: Path,
+    variant: str,
+) -> None:
+    items: list[dict[str, Any]] = []
+    for run in runs:
+        if run.get("scenario") == "gold_full":
+            continue
+        if run.get("file_id") == "__aggregate__":
+            continue
+        if not run.get("success"):
+            continue
+        file_slug = _slugify(str(run["file_id"]))
+        scenario_slug = _slugify(str(run["scenario"]))
+        gold_json_path = transcript_root / file_slug / "gold_full.json"
+        cand_json_path = transcript_root / file_slug / f"{scenario_slug}.json"
+        gold_txt_path = transcript_root / file_slug / "gold_full.txt"
+        cand_txt_path = transcript_root / file_slug / f"{scenario_slug}.txt"
+        if not gold_json_path.exists() or not cand_json_path.exists():
+            continue
+
+        gold_payload = json.loads(gold_json_path.read_text(encoding="utf-8"))
+        cand_payload = json.loads(cand_json_path.read_text(encoding="utf-8"))
+        diff_snippets = _extract_diff_snippets(
+            _join_segment_content(gold_payload.get("segments", [])),
+            _join_segment_content(cand_payload.get("segments", [])),
+        )
+        items.append(
+            make_review_item(
+                comparison={
+                    "variant": variant,
+                    "file_id": run.get("file_id"),
+                    "scenario": run.get("scenario"),
+                },
+                gold_txt_path=gold_txt_path,
+                candidate_txt_path=cand_txt_path,
+                metrics={
+                    key: run.get(key)
+                    for key in (
+                        "word_drift",
+                        "seam_word_drift",
+                        "char_drift",
+                        "boundary_mae_sec",
+                        "chunk_latency_p95_sec",
+                        "wall_time_sec",
+                        "rtf",
+                    )
+                },
+                diff_snippets=diff_snippets,
+            )
+        )
+
+    write_review_bundle(
+        output_dir=output_dir,
+        title="Chunking Variant Expert Review Template",
+        items=items,
+        group_by_fields=("variant", "scenario"),
+        source_kind="chunking_variant_experiment",
+        metadata={
+            "variant": variant,
+            "transcript_root": str(transcript_root),
+            "review_scope": "All successful non-gold transcripts in this variant run.",
+        },
+    )
 
 
 def _iter_quality_scenarios(
@@ -1691,7 +2108,9 @@ def _parse_args() -> argparse.Namespace:
             "Variant alias or comma-separated feature list. "
             "Aliases: baseline_overlap_context, idea1_sentence_seam, "
             "idea2_seam_micro_redo, idea3_shifted_consensus, "
-            "idea4_silence_aligned_boundaries, idea5_dynamic_lexicon."
+            "idea4_silence_aligned_boundaries, idea5_dynamic_lexicon, "
+            "idea6_coverage_first_repair, idea7_tail_rescue_backward_pass, "
+            "idea8_language_aware_translator_mode."
         ),
     )
     parser.add_argument(
@@ -1760,6 +2179,48 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="Minimum token length for dynamic lexicon candidates.",
+    )
+    parser.add_argument(
+        "--coverage-tail-gap-seconds",
+        type=float,
+        default=120.0,
+        help="Trigger coverage repair when transcript end is this many seconds before audio end.",
+    )
+    parser.add_argument(
+        "--coverage-repair-window-seconds",
+        type=float,
+        default=300.0,
+        help="Window size used for seam-local coverage repair requests.",
+    )
+    parser.add_argument(
+        "--coverage-repair-overlap-seconds",
+        type=float,
+        default=45.0,
+        help="Backward overlap applied when repairing a tail coverage gap.",
+    )
+    parser.add_argument(
+        "--coverage-repair-seam-guard-seconds",
+        type=float,
+        default=45.0,
+        help="Required transcript coverage radius around each seam before triggering repair.",
+    )
+    parser.add_argument(
+        "--coverage-repair-max-windows",
+        type=int,
+        default=3,
+        help="Maximum number of coverage repair windows per file/scenario.",
+    )
+    parser.add_argument(
+        "--tail-rescue-minutes",
+        type=float,
+        default=12.0,
+        help="Tail rescue window size in minutes for backward-pass rerun.",
+    )
+    parser.add_argument(
+        "--tail-rescue-min-seconds",
+        type=float,
+        default=180.0,
+        help="Minimum tail rescue window size in seconds.",
     )
     parser.add_argument(
         "--max-tokens",
@@ -2060,6 +2521,12 @@ def main() -> None:
         runs=all_runs,
         threshold=args.quality_threshold,
         transcript_root=output_dir / "transcripts",
+    )
+    _build_expert_review_bundle(
+        output_dir=output_dir,
+        runs=all_runs,
+        transcript_root=output_dir / "transcripts",
+        variant=args.variant,
     )
 
     print("[INFO] Experiment complete.")

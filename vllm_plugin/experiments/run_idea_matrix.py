@@ -19,14 +19,21 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import json
 import math
+import re
 import statistics
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    from vllm_plugin.experiments.expert_review import make_review_item, write_review_bundle
+except ModuleNotFoundError:
+    from expert_review import make_review_item, write_review_bundle
 
 
 VARIANT_ALIASES: dict[str, set[str]] = {
@@ -58,6 +65,11 @@ def _worker_grid(max_workers: int) -> list[int]:
 
 def _scenario_name(chunk_minutes: int) -> str:
     return f"chunk_{chunk_minutes}m_overlap_context"
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value).strip("_")
+    return slug or "item"
 
 
 def _parse_bool(value: Any) -> bool:
@@ -205,6 +217,30 @@ def _mean(values: list[float]) -> float | None:
     return float(statistics.mean(values))
 
 
+def _normalize_text(text: str) -> str:
+    normalized = text.lower().strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def _extract_diff_snippets(gold_text: str, cand_text: str, max_snippets: int = 3) -> list[str]:
+    gold_words = _normalize_text(gold_text).split()
+    cand_words = _normalize_text(cand_text).split()
+    matcher = difflib.SequenceMatcher(a=gold_words, b=cand_words)
+    snippets: list[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        gold_excerpt = " ".join(gold_words[max(0, i1 - 8) : min(len(gold_words), i2 + 8)])
+        cand_excerpt = " ".join(cand_words[max(0, j1 - 8) : min(len(cand_words), j2 + 8)])
+        snippets.append(
+            f"change={tag}; gold=`{gold_excerpt[:220]}`; candidate=`{cand_excerpt[:220]}`"
+        )
+        if len(snippets) >= max_snippets:
+            break
+    return snippets
+
+
 def _quality_metrics(rows: list[dict[str, Any]], scenario: str) -> dict[str, Any]:
     target = [
         row
@@ -243,6 +279,70 @@ def _throughput_aggregates(rows: list[dict[str, Any]], scenario: str) -> dict[in
             continue
         out[match] = row
     return out
+
+
+def _build_phase_expert_review_bundle(
+    phase_root: Path,
+    *,
+    phase_name: str,
+    scenario: str,
+    run_map: dict[str, tuple[str, Path, list[dict[str, Any]]]],
+) -> None:
+    items: list[dict[str, Any]] = []
+    for label, (variant_spec, artifact_dir, rows) in run_map.items():
+        for row in rows:
+            if str(row.get("scenario")) != scenario:
+                continue
+            if str(row.get("file_id")) == "__aggregate__":
+                continue
+            if not _parse_bool(row.get("success")):
+                continue
+            file_id = str(row.get("file_id"))
+            file_slug = _slugify(file_id)
+            gold_txt_path = artifact_dir / "transcripts" / file_slug / "gold_full.txt"
+            cand_txt_path = artifact_dir / "transcripts" / file_slug / f"{_slugify(scenario)}.txt"
+            if not gold_txt_path.exists() or not cand_txt_path.exists():
+                continue
+            gold_text = gold_txt_path.read_text(encoding="utf-8")
+            cand_text = cand_txt_path.read_text(encoding="utf-8")
+            items.append(
+                make_review_item(
+                    comparison={
+                        "variant": label,
+                        "variant_spec": variant_spec,
+                        "file_id": file_id,
+                        "scenario": scenario,
+                    },
+                    gold_txt_path=gold_txt_path,
+                    candidate_txt_path=cand_txt_path,
+                    metrics={
+                        key: row.get(key)
+                        for key in (
+                            "word_drift",
+                            "seam_word_drift",
+                            "char_drift",
+                            "boundary_mae_sec",
+                            "chunk_latency_p95_sec",
+                            "wall_time_sec",
+                            "rtf",
+                        )
+                    },
+                    diff_snippets=_extract_diff_snippets(gold_text, cand_text),
+                )
+            )
+
+    write_review_bundle(
+        output_dir=phase_root,
+        title=f"{phase_name} Idea Matrix Expert Review Template",
+        items=items,
+        group_by_fields=("variant",),
+        source_kind="idea_matrix_phase",
+        metadata={
+            "phase": phase_name,
+            "scenario": scenario,
+            "review_scope": "All successful candidate transcripts for this phase.",
+        },
+    )
 
 
 def _max_stable_worker(
@@ -793,6 +893,7 @@ def main() -> None:
     print(f"[INFO] Phase 2 max stable worker: {p2_max_stable}")
 
     phase2_rows: list[dict[str, Any]] = []
+    phase2_run_map: dict[str, tuple[str, Path, list[dict[str, Any]]]] = {}
     p2_baseline_score = _build_score_row(
         label="baseline",
         variant_spec="baseline_overlap_context",
@@ -804,6 +905,7 @@ def main() -> None:
         phase_name="phase2",
     )
     phase2_rows.append(p2_baseline_score)
+    phase2_run_map["baseline"] = ("baseline_overlap_context", p2_baseline_artifact, p2_baseline_rows)
 
     for label, variant_spec in finalists:
         if label == "baseline":
@@ -832,6 +934,7 @@ def main() -> None:
             phase_name="phase2",
         )
         phase2_rows.append(score)
+        phase2_run_map[label] = (variant_spec, artifact, rows)
 
     phase1_variant_csv = phase1_root / "variant_scoreboard.csv"
     phase1_variant_md = phase1_root / "variant_scoreboard.md"
@@ -846,6 +949,18 @@ def main() -> None:
     _write_scoreboard_md(phase1_combo_md, "Phase1 Combo Scoreboard", phase1_combo_rows)
     _write_csv(phase2_csv, phase2_rows)
     _write_scoreboard_md(phase2_md, "Phase2 Variant Scoreboard", phase2_rows)
+    _build_phase_expert_review_bundle(
+        phase1_root,
+        phase_name="Phase1",
+        scenario=scenario,
+        run_map=phase1_variant_runs,
+    )
+    _build_phase_expert_review_bundle(
+        phase2_root,
+        phase_name="Phase2",
+        scenario=scenario,
+        run_map=phase2_run_map,
+    )
 
     eligible_phase2 = [row for row in phase2_rows if row["label"] != "baseline" and _parse_bool(row.get("eligible"))]
     winner = _rank_best(eligible_phase2, require_eligible=False)

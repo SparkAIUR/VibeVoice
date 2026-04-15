@@ -15,6 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from vllm_plugin.experiments.expert_review import make_review_item, write_review_bundle
+except ModuleNotFoundError:
+    from expert_review import make_review_item, write_review_bundle
+
 
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value).strip("_")
@@ -362,6 +367,68 @@ def _build_manual_review(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _build_expert_review_bundle(
+    output_dir: Path,
+    quality_rows: list[dict[str, Any]],
+    prod_dir: Path,
+    spark_dir: Path,
+) -> None:
+    items: list[dict[str, Any]] = []
+    endpoint_to_dir = {"production": prod_dir, "spark": spark_dir}
+    for row in quality_rows:
+        if not row.get("success"):
+            continue
+        endpoint = str(row.get("endpoint"))
+        file_id = str(row.get("file_id"))
+        scenario = str(row.get("scenario"))
+        endpoint_dir = endpoint_to_dir.get(endpoint)
+        if endpoint_dir is None:
+            continue
+        gold_txt_path = prod_dir / "transcripts" / _slugify(file_id) / "gold_full.txt"
+        cand_txt_path = endpoint_dir / "transcripts" / _slugify(file_id) / f"{_slugify(scenario)}.txt"
+        gold_segments = _load_transcript_segments(prod_dir, file_id, "gold_full")
+        cand_segments = _load_transcript_segments(endpoint_dir, file_id, scenario)
+        diff_snippets = _extract_diff_snippets(
+            _join_segment_content(gold_segments),
+            _join_segment_content(cand_segments),
+        )
+        items.append(
+            make_review_item(
+                comparison={
+                    "endpoint": endpoint,
+                    "file_id": file_id,
+                    "scenario": scenario,
+                },
+                gold_txt_path=gold_txt_path,
+                candidate_txt_path=cand_txt_path,
+                metrics={
+                    key: row.get(key)
+                    for key in (
+                        "word_drift",
+                        "char_drift",
+                        "boundary_mae_sec",
+                        "rtf",
+                        "wall_time_sec",
+                    )
+                },
+                diff_snippets=diff_snippets,
+            )
+        )
+
+    write_review_bundle(
+        output_dir=output_dir,
+        title="A/B Endpoint Expert Review Template",
+        items=items,
+        group_by_fields=("endpoint", "scenario"),
+        source_kind="ab_compare",
+        metadata={
+            "production_artifact_dir": str(prod_dir),
+            "spark_artifact_dir": str(spark_dir),
+            "review_scope": "All successful quality rows compared against production gold.",
+        },
+    )
+
+
 def _extract_base_scenario(throughput_scenario_name: str) -> str | None:
     match = re.match(r"^throughput_workers_\d+_(.+)$", throughput_scenario_name)
     return match.group(1) if match else None
@@ -508,6 +575,7 @@ def main() -> None:
     _write_csv(quality_csv, quality_rows)
     summary_text = _summarize_quality_md(quality_md, quality_rows, args.quality_threshold)
     _build_manual_review(review_md, quality_rows, prod_dir, spark_dir, args.quality_threshold)
+    _build_expert_review_bundle(output_dir, quality_rows, prod_dir, spark_dir)
     if throughput_rows:
         _write_csv(throughput_csv, throughput_rows)
         _summarize_throughput_md(throughput_md, throughput_rows)

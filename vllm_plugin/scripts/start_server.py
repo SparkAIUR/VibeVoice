@@ -9,9 +9,10 @@ One-click deployment script that handles:
 4. Generating tokenizer files
 5. Starting vLLM server
 
-For DP > 1, launches N independent vLLM processes behind an nginx
-reverse proxy for optimal throughput (avoids single-process HTTP
-bottleneck of vLLM's built-in DP coordinator).
+For DP > 1, can either:
+1) launch N independent vLLM processes behind an nginx reverse proxy, or
+2) run vLLM's built-in data-parallel coordinator directly
+   (use --disable-nginx-lb).
 
 Usage:
     python3 start_server.py [--model MODEL_ID] [--port PORT]
@@ -373,6 +374,9 @@ Examples:
     # Data parallel: 4 replicas on 4 GPUs (nginx load balancing)
     python3 start_server.py --dp 4
 
+    # Data parallel without in-pod nginx (use vLLM built-in DP coordinator)
+    python3 start_server.py --dp 4 --disable-nginx-lb
+
     # Tensor parallel: split model across 2 GPUs
     python3 start_server.py --tp 2
 
@@ -414,6 +418,15 @@ Examples:
         default=1,
         dest="data_parallel_size",
         help="Data parallel size: run N independent model replicas for load balancing (default: 1)"
+    )
+    parser.add_argument(
+        "--disable-nginx-lb",
+        action="store_true",
+        dest="disable_nginx_lb",
+        help=(
+            "Disable in-pod nginx fan-out for --dp > 1 and use vLLM built-in "
+            "data-parallel coordinator directly."
+        ),
     )
     parser.add_argument(
         "--max-num-seqs",
@@ -473,7 +486,7 @@ Examples:
         generate_tokenizer(model_path)
 
     # Step 5: Start server
-    if args.data_parallel_size > 1:
+    if args.data_parallel_size > 1 and not args.disable_nginx_lb:
         start_dp_server(
             model_path, args.port,
             data_parallel_size=args.data_parallel_size,
@@ -484,10 +497,15 @@ Examples:
             enforce_eager=args.enforce_eager,
         )
     else:
+        if args.data_parallel_size > 1 and args.disable_nginx_lb:
+            print("\n" + "=" * 60)
+            print("  Nginx DP fan-out disabled; using vLLM built-in DP coordinator")
+            print(f"  Data Parallel (DP): {args.data_parallel_size}")
+            print("=" * 60 + "\n")
         start_vllm_server(
             model_path, args.port,
             tensor_parallel_size=args.tensor_parallel_size,
-            data_parallel_size=1,
+            data_parallel_size=args.data_parallel_size,
             max_num_seqs=args.max_num_seqs,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
